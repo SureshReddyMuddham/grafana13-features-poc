@@ -1,0 +1,191 @@
+# Grafana 13 Features POC
+#
+# Stack:
+#   - Grafana 13.1.0 (standalone) - the latest with all v13 features
+#   - Prometheus - metrics backend
+#   - Loki - logs backend
+#   - Tempo - traces backend
+#   - Pyroscope - profiles backend
+#   - OTel Collector - fan-out for traces/metrics/logs
+#   - eBPF Profiler - zero-instrumentation CPU profiles
+#   - 2 Node.js apps - generate telemetry
+#
+# Features to test:
+#   - Grafana Assistant (AI-powered)
+#   - Dynamic Dashboards
+#   - Git Sync for dashboards
+#   - Restore Deleted Dashboards
+#   - Quick Filters & Grouping
+#   - Panel Styles
+#   - Improved Annotations
+#   - Saved Queries
+#   - New Graphviz Panel
+#   - Grafana Advisor
+#   - Revamped Query Editor
+
+services:
+  # ---- Ollama (local LLM for grafana-llm-app) ----
+  # Provides fully local AI without needing Grafana Cloud or external APIs
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+  # ---- Grafana 13 (standalone) ----
+  grafana:
+    image: grafana/grafana:13.1.0-24866141508
+    container_name: grafana13
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # Enable feature flags for v13 features
+      - GF_FEATURE_TOGGLES_ENABLE=grafanaAssistant,dynamicDashboards,kubernetesDashboards,provisioning,panelStyles,annotationClustering,quickFiltersAndGrouping,savedQueries,graphvizPanel
+      # Allow loading of unsigned plugins for testing
+      - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=
+      # Install plugins
+      - GF_INSTALL_PLUGINS=grafana-pyroscope-app,grafana-llm-app,grafana-assistant-app
+      # Anonymous access for easier demo
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      # Dashboard provisioning
+      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---- Prometheus (metrics) ----
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-otlp-receiver       # accept OTLP metrics
+      - --web.enable-remote-write-receiver
+      - --enable-feature=native-histograms
+      - --storage.tsdb.path=/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+
+  # ---- Loki (logs) ----
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    command: -config.file=/etc/loki/loki-config.yml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml
+      - loki-data:/loki
+
+  # ---- Tempo (traces) ----
+  tempo:
+    image: grafana/tempo:latest
+    container_name: tempo
+    command: -config.file=/etc/tempo.yml
+    ports:
+      - "3200:3200"   # Tempo HTTP
+      - "9095:9095"   # Tempo gRPC
+    volumes:
+      - ./tempo/tempo.yml:/etc/tempo.yml
+      - tempo-data:/var/tempo
+
+  # ---- Pyroscope (profiles) ----
+  pyroscope:
+    image: grafana/pyroscope:main-aa6937b
+    container_name: pyroscope
+    command:
+      - -config.file=/etc/pyroscope.yaml
+      - -self-profiling.disable-push=true
+    ports:
+      - "4040:4040"
+    volumes:
+      - pyroscope-data:/data
+      - ./pyroscope/pyroscope.yaml:/etc/pyroscope.yaml:ro
+
+  # ---- OTel Collector ----
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml", "--feature-gates=service.profilesSupport"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    user: "0:0"
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Collector self-metrics
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+  # ---- OTel eBPF Profiler ----
+  ebpf-profiler:
+    image: otel/opentelemetry-collector-ebpf-profiler:latest
+    container_name: ebpf-profiler
+    command:
+      - --config=/etc/ebpf-profiler-config.yaml
+      - --feature-gates=service.profilesSupport
+    privileged: true
+    pid: "host"
+    volumes:
+      - ./otel-collector/ebpf-profiler-config.yaml:/etc/ebpf-profiler-config.yaml:ro
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+      - /proc:/proc:ro
+    depends_on:
+      - pyroscope
+    restart: on-failure
+
+  # ---- Orders API ----
+  orders-api:
+    build: ./app
+    container_name: orders-api
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - OTEL_SERVICE_NAME=orders-api
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - NODE_OPTIONS=--require ./src/instrumentation.js
+    depends_on:
+      - otel-collector
+    restart: on-failure
+
+  # ---- Payment Service ----
+  payment-service:
+    build: ./payment-service
+    container_name: payment-service
+    ports:
+      - "3002:3001"
+    environment:
+      - PORT=3001
+      - OTEL_SERVICE_NAME=payment-service
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+    depends_on:
+      - otel-collector
+    restart: on-failure
+
+volumes:
+  grafana-data:
+  prometheus-data:
+  loki-data:
+  tempo-data:
+  pyroscope-data:
+  ollama-data:
